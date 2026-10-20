@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <map>
 #include <string>
@@ -136,27 +138,38 @@ DWORD find_process() {
     return found;
 }
 
+// Cherche le module exact ; sinon retombe sur un module "FortniteClient*" ;
+// sinon sur le premier module de la liste (= l'exe principal du process).
 uintptr_t module_base(DWORD pid, const wchar_t* module) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return 0;
     }
 
-    uintptr_t base = 0;
+    uintptr_t exact = 0;
+    uintptr_t loose = 0;
+    uintptr_t first = 0;
+
     MODULEENTRY32W entry{};
     entry.dwSize = sizeof(entry);
 
     if (Module32FirstW(snapshot, &entry)) {
         do {
+            if (!first) {
+                first = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
+            }
             if (_wcsicmp(entry.szModule, module) == 0) {
-                base = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
+                exact = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
                 break;
+            }
+            if (!loose && wcsstr(entry.szModule, L"FortniteClient")) {
+                loose = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
             }
         } while (Module32NextW(snapshot, &entry));
     }
 
     CloseHandle(snapshot);
-    return base;
+    return exact ? exact : (loose ? loose : first);
 }
 
 HWND find_window(DWORD pid) {
@@ -218,7 +231,12 @@ bool attach(DWORD pid) {
 
     g_pid = pid;
     g_base = module_base(pid, L"FortniteClient-Win64-Shipping.exe");
-    return g_base != 0;
+    if (!g_base) {
+        CloseHandle(g_process);
+        g_process = nullptr;
+        return false;
+    }
+    return true;
 }
 
 } // namespace mem
@@ -731,6 +749,9 @@ int g_width = 0;
 int g_height = 0;
 HFONT g_font = nullptr;
 
+bool g_visible = false;   // la fenetre overlay est-elle affichee ?
+bool g_anchored = false;  // la derniere sync() a-t-elle abouti ?
+
 COLORREF to_gdi(uint32_t color) {
     return RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
 }
@@ -791,38 +812,63 @@ bool create(HINSTANCE instance) {
     SelectObject(g_dc, g_font);
 
     SetBkMode(g_dc, TRANSPARENT);
-    ShowWindow(g_window, SW_SHOWNOACTIVATE);
+
+    // Volontairement pas de ShowWindow ici : une fenetre layered sans
+    // UpdateLayeredWindow s'affiche en rectangle noir. On la montre seulement
+    // quand on a une position, une taille et une premiere frame.
     return true;
 }
 
-void sync() {
+void hide() {
+    g_anchored = false;
+    if (g_window && g_visible) {
+        ShowWindow(g_window, SW_HIDE);
+        g_visible = false;
+    }
+}
+
+void show() {
+    if (g_window && !g_visible) {
+        ShowWindow(g_window, SW_SHOWNOACTIVATE);
+        g_visible = true;
+    }
+}
+
+// Recale l'overlay sur la zone client du jeu. Renvoie false si le jeu n'est pas
+// exploitable (fenetre absente, minimisee, taille nulle) : l'overlay est alors masque.
+bool sync() {
     HWND game = mem::g_window;
-    if (!game || !IsWindow(game)) {
-        return;
+    if (!game || !IsWindow(game) || IsIconic(game)) {
+        hide();
+        return false;
     }
 
     RECT client{};
-    if (!GetClientRect(game, &client)) {
-        return;
+    if (!GetClientRect(game, &client) || client.right < 320 || client.bottom < 240) {
+        hide();
+        return false;
     }
 
     POINT origin{0, 0};
     ClientToScreen(game, &origin);
 
     if (!resize(client.right, client.bottom)) {
-        return;
+        hide();
+        return false;
     }
 
     RECT current{};
     GetWindowRect(g_window, &current);
-    if (current.left != origin.x || current.top != origin.y || current.right - current.left != client.right ||
-        current.bottom - current.top != client.bottom) {
+    if (current.left != origin.x || current.top != origin.y ||
+        current.right - current.left != client.right || current.bottom - current.top != client.bottom) {
         SetWindowPos(g_window, HWND_TOPMOST, origin.x, origin.y, client.right, client.bottom,
                      SWP_NOACTIVATE);
     }
 
     sdk::g_screenWidth = client.right;
     sdk::g_screenHeight = client.bottom;
+    g_anchored = true;
+    return true;
 }
 
 void clear() {
@@ -832,7 +878,7 @@ void clear() {
 }
 
 void present() {
-    if (!g_pixels) {
+    if (!g_pixels || !g_anchored) {
         return;
     }
 
@@ -853,6 +899,9 @@ void present() {
     HDC screen = GetDC(nullptr);
     UpdateLayeredWindow(g_window, screen, &destination, &size, g_dc, &source, 0, &blend, ULW_ALPHA);
     ReleaseDC(nullptr, screen);
+
+    // Premiere frame deja dessinee : on peut afficher sans flash noir.
+    show();
 }
 
 void rect(int x, int y, int width, int height, uint32_t color, int thickness) {
@@ -1138,6 +1187,14 @@ void legend(bool espOn, int fps, bool memoryTp) {
 
 namespace {
 
+void log(const wchar_t* format, ...) {
+    va_list args;
+    va_start(args, format);
+    std::vwprintf(format, args);
+    va_end(args);
+    fflush(stdout);
+}
+
 void attach_console() {
     if (!AllocConsole()) {
         return;
@@ -1152,9 +1209,9 @@ void attach_console() {
 }
 
 void banner() {
-    std::wprintf(L"\n");
-    std::wprintf(L"  Retrac OGFN - external\n");
-    std::wprintf(L"  --------------------------------------------\n");
+    log(L"\n");
+    log(L"  Retrac OGFN - external\n");
+    log(L"  --------------------------------------------\n");
 }
 
 } // namespace
@@ -1164,70 +1221,98 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     banner();
 
     if (mem::enable_debug_privilege()) {
-        std::wprintf(L"  [ok] SeDebugPrivilege\n");
+        log(L"  [ok] SeDebugPrivilege\n");
     } else {
-        std::wprintf(L"  [avert] SeDebugPrivilege indisponible (lance en administrateur)\n");
+        log(L"  [avert] SeDebugPrivilege indisponible (lance en administrateur)\n");
     }
 
     if (!offsets::load()) {
-        std::wprintf(L"\n  offsets.json attendu dans %%LOCALAPPDATA%%\\RetracOGFN\\\n");
-        std::wprintf(L"  Lance une fois RetracOGFN.exe pour le generer.\n");
-        std::wprintf(L"\n  Entree pour quitter...");
+        log(L"\n  offsets.json attendu dans %%LOCALAPPDATA%%\\RetracOGFN\\\n");
+        log(L"  ou a cote de l'exe. Lance une fois l'outil interne pour le generer.\n");
+        log(L"\n  Entree pour quitter...");
         getchar();
         return 1;
     }
 
-    std::wprintf(L"  [info] recherche de Fortnite...\n");
+    log(L"  [info] recherche de Fortnite...\n");
 
     DWORD pid = 0;
     for (int attempt = 0; attempt < 240 && !pid; ++attempt) {
         pid = mem::find_process();
         if (!pid) {
+            if (attempt % 4 == 0) {
+                log(L".");
+            }
             Sleep(500);
         }
     }
     if (!pid) {
-        std::wprintf(L"  [erreur] FortniteClient-Win64-Shipping.exe introuvable\n");
+        log(L"\n  [erreur] FortniteClient-Win64-Shipping.exe introuvable\n");
+        log(L"\n  Entree pour quitter...");
         getchar();
         return 1;
     }
 
     if (!mem::attach(pid)) {
-        std::wprintf(L"  [erreur] attache au process %lu impossible\n", pid);
+        log(L"\n  [erreur] attache au process %lu impossible (base module)\n", pid);
+        log(L"\n  Entree pour quitter...");
         getchar();
         return 1;
     }
 
-    std::wprintf(L"  [ok] process %lu, base 0x%llX\n", pid,
-                 static_cast<unsigned long long>(mem::g_base));
+    log(L"\n  [ok] process %lu, base 0x%llX\n", pid,
+        static_cast<unsigned long long>(mem::g_base));
 
+    log(L"  [info] recherche de la fenetre de jeu...\n");
     for (int attempt = 0; attempt < 240 && !mem::g_window; ++attempt) {
         mem::g_window = mem::find_window(pid);
         if (!mem::g_window) {
+            if (attempt % 4 == 0) {
+                log(L".");
+            }
             Sleep(500);
         }
     }
 
+    if (mem::g_window) {
+        log(L"\n  [ok] fenetre de jeu trouvee\n");
+    } else {
+        log(L"\n  [avert] fenetre de jeu introuvable : overlay masque pour l'instant\n");
+        log(L"          Fortnite doit etre en fenetre sans bordure (pas plein ecran exclusif).\n");
+    }
+
     if (!overlay::create(instance)) {
-        std::wprintf(L"  [erreur] overlay impossible\n");
+        log(L"  [erreur] creation overlay impossible\n");
+        log(L"\n  Entree pour quitter...");
         getchar();
         return 1;
     }
 
-    std::wprintf(L"  [ok] overlay pret. Inser = ESP, clic droit = aimbot, Y = bullet TP, F8 = quitter\n");
-    std::wprintf(L"  [info] le jeu doit etre en fenetre sans bordure (pas plein ecran exclusif)\n");
+    log(L"  [ok] overlay pret. Inser = ESP, clic droit = aimbot, Y = bullet TP, F8 = quitter\n");
 
     const bool memoryTp = offsets::g.PlayerController_ControlRotation != 0;
     bool espOn = true;
     int frames = 0;
     int fps = 0;
     ULONGLONG fpsTime = GetTickCount64();
+    ULONGLONG windowRetry = GetTickCount64();
+    bool warnedWindow = mem::g_window != nullptr;
 
     bool running = true;
     while (running) {
         if (!mem::g_process || WaitForSingleObject(mem::g_process, 0) != WAIT_TIMEOUT) {
-            std::wprintf(L"  [info] Fortnite ferme, sortie\n");
+            log(L"  [info] Fortnite ferme, sortie\n");
             break;
+        }
+
+        // La fenetre peut apparaitre (ou revenir) apres coup : on retente.
+        if (!mem::g_window && GetTickCount64() - windowRetry > 1000) {
+            windowRetry = GetTickCount64();
+            mem::g_window = mem::find_window(pid);
+            if (mem::g_window && !warnedWindow) {
+                log(L"  [ok] fenetre de jeu trouvee\n");
+                warnedWindow = true;
+            }
         }
 
         if (input::pressed(cfg::kEspKey)) {
@@ -1271,7 +1356,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         DestroyWindow(overlay::g_window);
     }
 
-    std::wprintf(L"\n  Entree pour quitter...");
+    log(L"\n  Entree pour quitter...");
     getchar();
     return 0;
 }
