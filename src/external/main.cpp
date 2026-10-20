@@ -6,10 +6,12 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <map>
 #include <string>
 #include <vector>
