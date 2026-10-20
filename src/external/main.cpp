@@ -1,6 +1,9 @@
 // Retrac OGFN - external. Un seul exe, aucune injection :
 // ReadProcessMemory/WriteProcessMemory sur FortniteClient-Win64-Shipping.exe,
 // overlay GDI layered par-dessus le jeu (ESP), souris (aimbot + bullet TP).
+//
+// Autonome : offsets par defaut embarques (build 42.40) + offsets.json ecrit
+// a cote de l'exe pour les ajuster sans recompiler.
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -41,6 +44,19 @@ constexpr uint32_t kColorText = 0xE8E8E8;
 constexpr uint32_t kColorDim = 0x9A9A9A;
 
 } // namespace cfg
+
+// ---------------------------------------------------------------------------
+// Diag (panneau de statut)
+// ---------------------------------------------------------------------------
+
+namespace diag {
+
+bool processOk = false;
+bool worldOk = false;
+int offsetsCount = 0;
+std::wstring logPath;
+
+} // namespace diag
 
 // ---------------------------------------------------------------------------
 // Process / memoire
@@ -138,8 +154,6 @@ DWORD find_process() {
     return found;
 }
 
-// Cherche le module exact ; sinon retombe sur un module "FortniteClient*" ;
-// sinon sur le premier module de la liste (= l'exe principal du process).
 uintptr_t module_base(DWORD pid, const wchar_t* module) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snapshot == INVALID_HANDLE_VALUE) {
@@ -242,16 +256,20 @@ bool attach(DWORD pid) {
 } // namespace mem
 
 // ---------------------------------------------------------------------------
-// Offsets : lus dans le offsets.json deja utilise par la DLL interne
+// Offsets : defauts embarques, surcharges par offsets.json si present
 // ---------------------------------------------------------------------------
 
 namespace offsets {
 
 struct Table {
-    uintptr_t GWorld = 0;
+    uintptr_t GameEngine = 0;             // module : GEngine
+    uintptr_t GameEngine_GameViewport = 0;
+    uintptr_t GameViewport_World = 0;
+    uintptr_t GWorld = 0;                 // global direct (chiffre sur 42.40)
     uintptr_t World_Levels = 0;
     uintptr_t World_OwningGameInstance = 0;
-    uintptr_t Level_Actors = 0;
+    uintptr_t Level_ActorCluster = 0;
+    uintptr_t LevelActorContainer_Actors = 0;
     uintptr_t GameInstance_LocalPlayers = 0;
     uintptr_t LocalPlayer_PlayerController = 0;
     uintptr_t PlayerController_AcknowledgedPawn = 0;
@@ -261,18 +279,53 @@ struct Table {
     uintptr_t CameraCache_POV = 0;
     uintptr_t Pawn_PlayerState = 0;
     uintptr_t Pawn_Mesh = 0;
-    uintptr_t Pawn_Health = 0;
+    uintptr_t Pawn_IsDBNO = 0;
     uintptr_t Actor_RootComponent = 0;
     uintptr_t SceneComponent_RelativeLocation = 0;
     uintptr_t PlayerState_PlayerName = 0;
+    uintptr_t PlayerState_PlayerNameAlt = 0;
     uintptr_t PlayerState_TeamIndex = 0;
     uintptr_t PlayerState_IsABot = 0;
-    uintptr_t PlayerState_IsDBNO = 0;
     uintptr_t Mesh_BoneArray = 0;
     uintptr_t Mesh_ComponentToWorld = 0;
 };
 
 Table g;
+
+// Build 42.40-CL-59086525 (dumps du 15/10/2026). A ajuster apres un patch.
+struct Default {
+    const char* key;
+    uintptr_t value;
+};
+
+const Default kDefaults[] = {
+    {"GameEngine", 0x1BD9D378},
+    {"GameEngine_GameViewport", 0xB70},
+    {"GameViewport_World", 0x78},
+    {"GWorld", 0x1BD9B9E8},
+    {"World_Levels", 0x1F0},
+    {"World_OwningGameInstance", 0x250},
+    {"Level_ActorCluster", 0x98},
+    {"LevelActorContainer_Actors", 0x50},
+    {"GameInstance_LocalPlayers", 0x38},
+    {"LocalPlayer_PlayerController", 0x30},
+    {"PlayerController_AcknowledgedPawn", 0x318},
+    {"PlayerController_PlayerCameraManager", 0x328},
+    {"PlayerController_ControlRotation", 0x2E8},
+    {"CameraManager_CameraCache", 0x1590},
+    {"CameraCache_POV", 0x10},
+    {"Pawn_PlayerState", 0x290},
+    {"Pawn_Mesh", 0x2F0},
+    {"Pawn_IsDBNO", 0x881},
+    {"Actor_RootComponent", 0x1B0},
+    {"SceneComponent_RelativeLocation", 0x140},
+    {"PlayerState_PlayerName", 0x308},
+    {"PlayerState_PlayerNameAlt", 0x340},
+    {"PlayerState_TeamIndex", 0xF69},
+    {"PlayerState_IsABot", 0x27A},
+    {"Mesh_BoneArray", 0x660},
+    {"Mesh_ComponentToWorld", 0x1E0},
+};
 
 std::string normalize(const std::string& text) {
     std::string out;
@@ -343,6 +396,18 @@ bool read_file(const std::wstring& path, std::string& out) {
     return ok && bytes != 0;
 }
 
+std::wstring exe_directory() {
+    wchar_t exePath[MAX_PATH * 2]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH * 2);
+
+    std::wstring directory = exePath;
+    const size_t slash = directory.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        directory.resize(slash);
+    }
+    return directory;
+}
+
 uintptr_t lookup(const std::map<std::string, uintptr_t>& table,
                  std::initializer_list<const char*> names) {
     for (const char* name : names) {
@@ -365,27 +430,63 @@ uintptr_t lookup(const std::map<std::string, uintptr_t>& table,
     return 0;
 }
 
-bool load() {
-    std::vector<std::wstring> candidates;
+uintptr_t pick(const std::map<std::string, uintptr_t>& table, uintptr_t fallback,
+               std::initializer_list<const char*> names) {
+    const uintptr_t value = lookup(table, names);
+    return value ? value : fallback;
+}
 
-    wchar_t exePath[MAX_PATH * 2]{};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH * 2);
-    std::wstring exeDirectory = exePath;
-    const size_t slash = exeDirectory.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) {
-        exeDirectory.resize(slash);
+// Ecrit le jeu d'offsets resolu a cote de l'exe : sert de base editable.
+void dump_json(const std::wstring& path) {
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"w") != 0 || !file) {
+        return;
     }
 
-    candidates.push_back(exeDirectory + L"\\offsets.json");
+    fprintf(file, "{\n");
+    fprintf(file, "  \"_build\": \"42.40-CL-59086525\",\n");
+    fprintf(file, "  \"_note\": \"ajuste ici si un patch casse la chaine, l'exe relit ce fichier au demarrage\",\n");
+    fprintf(file, "  \"GameEngine\": \"0x%llX\",\n", (unsigned long long)g.GameEngine);
+    fprintf(file, "  \"GameEngine_GameViewport\": \"0x%llX\",\n", (unsigned long long)g.GameEngine_GameViewport);
+    fprintf(file, "  \"GameViewport_World\": \"0x%llX\",\n", (unsigned long long)g.GameViewport_World);
+    fprintf(file, "  \"GWorld\": \"0x%llX\",\n", (unsigned long long)g.GWorld);
+    fprintf(file, "  \"World_Levels\": \"0x%llX\",\n", (unsigned long long)g.World_Levels);
+    fprintf(file, "  \"World_OwningGameInstance\": \"0x%llX\",\n", (unsigned long long)g.World_OwningGameInstance);
+    fprintf(file, "  \"Level_ActorCluster\": \"0x%llX\",\n", (unsigned long long)g.Level_ActorCluster);
+    fprintf(file, "  \"LevelActorContainer_Actors\": \"0x%llX\",\n", (unsigned long long)g.LevelActorContainer_Actors);
+    fprintf(file, "  \"GameInstance_LocalPlayers\": \"0x%llX\",\n", (unsigned long long)g.GameInstance_LocalPlayers);
+    fprintf(file, "  \"LocalPlayer_PlayerController\": \"0x%llX\",\n", (unsigned long long)g.LocalPlayer_PlayerController);
+    fprintf(file, "  \"PlayerController_AcknowledgedPawn\": \"0x%llX\",\n", (unsigned long long)g.PlayerController_AcknowledgedPawn);
+    fprintf(file, "  \"PlayerController_PlayerCameraManager\": \"0x%llX\",\n", (unsigned long long)g.PlayerController_PlayerCameraManager);
+    fprintf(file, "  \"PlayerController_ControlRotation\": \"0x%llX\",\n", (unsigned long long)g.PlayerController_ControlRotation);
+    fprintf(file, "  \"CameraManager_CameraCache\": \"0x%llX\",\n", (unsigned long long)g.CameraManager_CameraCache);
+    fprintf(file, "  \"CameraCache_POV\": \"0x%llX\",\n", (unsigned long long)g.CameraCache_POV);
+    fprintf(file, "  \"Pawn_PlayerState\": \"0x%llX\",\n", (unsigned long long)g.Pawn_PlayerState);
+    fprintf(file, "  \"Pawn_Mesh\": \"0x%llX\",\n", (unsigned long long)g.Pawn_Mesh);
+    fprintf(file, "  \"Pawn_IsDBNO\": \"0x%llX\",\n", (unsigned long long)g.Pawn_IsDBNO);
+    fprintf(file, "  \"Actor_RootComponent\": \"0x%llX\",\n", (unsigned long long)g.Actor_RootComponent);
+    fprintf(file, "  \"SceneComponent_RelativeLocation\": \"0x%llX\",\n", (unsigned long long)g.SceneComponent_RelativeLocation);
+    fprintf(file, "  \"PlayerState_PlayerName\": \"0x%llX\",\n", (unsigned long long)g.PlayerState_PlayerName);
+    fprintf(file, "  \"PlayerState_TeamIndex\": \"0x%llX\",\n", (unsigned long long)g.PlayerState_TeamIndex);
+    fprintf(file, "  \"PlayerState_IsABot\": \"0x%llX\",\n", (unsigned long long)g.PlayerState_IsABot);
+    fprintf(file, "  \"Mesh_BoneArray\": \"0x%llX\",\n", (unsigned long long)g.Mesh_BoneArray);
+    fprintf(file, "  \"Mesh_ComponentToWorld\": \"0x%llX\"\n", (unsigned long long)g.Mesh_ComponentToWorld);
+    fprintf(file, "}\n");
+
+    fclose(file);
+}
+
+bool load() {
+    std::map<std::string, uintptr_t> table;
+
+    std::vector<std::wstring> candidates;
+    candidates.push_back(exe_directory() + L"\\offsets.json");
 
     wchar_t localAppData[MAX_PATH * 2]{};
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH * 2)) {
-        const std::wstring folder = std::wstring(localAppData) + L"\\RetracOGFN";
-        candidates.push_back(folder + L"\\offsets.example.json");
-        candidates.push_back(folder + L"\\offsets.json");
+        candidates.push_back(std::wstring(localAppData) + L"\\RetracOGFN\\offsets.json");
     }
 
-    std::map<std::string, uintptr_t> table;
     for (const std::wstring& path : candidates) {
         std::string text;
         if (!read_file(path, text)) {
@@ -396,53 +497,56 @@ bool load() {
         for (const auto& [key, value] : parsed) {
             table[key] = value;
         }
-        std::wprintf(L"  [info] offsets : %s (%zu entrees)\n", path.c_str(), parsed.size());
+        std::wprintf(L"  [info] offsets externes : %s (%zu entrees)\n", path.c_str(), parsed.size());
     }
 
-    if (table.empty()) {
-        std::wprintf(L"  [erreur] aucun offsets.json trouve.\n");
-        return false;
-    }
-
-    g.GWorld = lookup(table, {"GWorld", "UWorld", "World"});
-    g.World_Levels = lookup(table, {"World_Levels", "Levels"});
-    g.World_OwningGameInstance = lookup(table, {"World_OwningGameInstance", "OwningGameInstance"});
-    g.Level_Actors = lookup(table, {"Level_Actors", "Actors"});
-    g.GameInstance_LocalPlayers = lookup(table, {"GameInstance_LocalPlayers", "LocalPlayers"});
-    g.LocalPlayer_PlayerController = lookup(table, {"LocalPlayer_PlayerController", "PlayerController"});
-    g.PlayerController_AcknowledgedPawn =
-        lookup(table, {"PlayerController_AcknowledgedPawn", "AcknowledgedPawn"});
-    g.PlayerController_PlayerCameraManager =
-        lookup(table, {"PlayerController_PlayerCameraManager", "PlayerCameraManager", "CameraManager"});
-    g.PlayerController_ControlRotation =
-        lookup(table, {"PlayerController_ControlRotation", "ControlRotation"});
-    g.CameraManager_CameraCache = lookup(table, {"CameraManager_CameraCache", "CameraCache"});
-    g.CameraCache_POV = lookup(table, {"CameraCache_POV", "POV"});
-    g.Pawn_PlayerState = lookup(table, {"Pawn_PlayerState", "PlayerState"});
-    g.Pawn_Mesh = lookup(table, {"Pawn_Mesh", "Mesh"});
-    g.Pawn_Health = lookup(table, {"Pawn_Health", "Health"});
-    g.Actor_RootComponent = lookup(table, {"Actor_RootComponent", "RootComponent"});
-    g.SceneComponent_RelativeLocation =
-        lookup(table, {"SceneComponent_RelativeLocation", "RelativeLocation"});
-    g.PlayerState_PlayerName = lookup(table, {"PlayerState_PlayerName", "PlayerName"});
-    g.PlayerState_TeamIndex = lookup(table, {"PlayerState_TeamIndex", "TeamIndex"});
-    g.PlayerState_IsABot = lookup(table, {"PlayerState_IsABot", "IsABot", "bIsABot"});
-    g.PlayerState_IsDBNO = lookup(table, {"PlayerState_IsDBNO", "IsDBNO", "bIsDBNO"});
-    g.Mesh_BoneArray = lookup(table, {"Mesh_BoneArray", "BoneArray"});
-    g.Mesh_ComponentToWorld = lookup(table, {"Mesh_ComponentToWorld", "ComponentToWorld"});
-
-    const uintptr_t critical[] = {g.GWorld, g.World_Levels, g.Level_Actors,
-                                  g.World_OwningGameInstance, g.GameInstance_LocalPlayers};
-    for (const uintptr_t value : critical) {
-        if (!value) {
-            std::wprintf(L"  [erreur] offsets indispensables absents (GWorld / Levels / Actors / "
-                         L"GameInstance / LocalPlayers)\n");
-            return false;
+    // Surcharge fichier si present, sinon valeur par defaut embarquee.
+    auto def = [](const char* key) -> uintptr_t {
+        for (const Default& entry : kDefaults) {
+            if (strcmp(entry.key, key) == 0) {
+                return entry.value;
+            }
         }
+        return 0;
+    };
+
+    g.GameEngine = pick(table, def("GameEngine"), {"GameEngine", "gEngine"});
+    g.GameEngine_GameViewport = pick(table, def("GameEngine_GameViewport"), {"GameEngine_GameViewport"});
+    g.GameViewport_World = pick(table, def("GameViewport_World"), {"GameViewport_World"});
+    g.GWorld = pick(table, def("GWorld"), {"GWorld", "UWorld", "World"});
+    g.World_Levels = pick(table, def("World_Levels"), {"World_Levels", "Levels"});
+    g.World_OwningGameInstance = pick(table, def("World_OwningGameInstance"), {"World_OwningGameInstance", "OwningGameInstance", "GameInstance"});
+    g.Level_ActorCluster = pick(table, def("Level_ActorCluster"), {"Level_ActorCluster", "ActorCluster"});
+    g.LevelActorContainer_Actors = pick(table, def("LevelActorContainer_Actors"), {"LevelActorContainer_Actors"});
+    g.GameInstance_LocalPlayers = pick(table, def("GameInstance_LocalPlayers"), {"GameInstance_LocalPlayers", "LocalPlayers"});
+    g.LocalPlayer_PlayerController = pick(table, def("LocalPlayer_PlayerController"), {"LocalPlayer_PlayerController", "PlayerController"});
+    g.PlayerController_AcknowledgedPawn = pick(table, def("PlayerController_AcknowledgedPawn"), {"PlayerController_AcknowledgedPawn", "AcknowledgedPawn", "LocalPawn"});
+    g.PlayerController_PlayerCameraManager = pick(table, def("PlayerController_PlayerCameraManager"), {"PlayerController_PlayerCameraManager", "PlayerCameraManager", "CameraManager"});
+    g.PlayerController_ControlRotation = pick(table, def("PlayerController_ControlRotation"), {"PlayerController_ControlRotation", "ControlRotation"});
+    g.CameraManager_CameraCache = pick(table, def("CameraManager_CameraCache"), {"CameraManager_CameraCache", "CameraCache", "CameraCachePrivate"});
+    g.CameraCache_POV = pick(table, def("CameraCache_POV"), {"CameraCache_POV", "POV"});
+    g.Pawn_PlayerState = pick(table, def("Pawn_PlayerState"), {"Pawn_PlayerState", "PlayerState"});
+    g.Pawn_Mesh = pick(table, def("Pawn_Mesh"), {"Pawn_Mesh", "Mesh"});
+    g.Pawn_IsDBNO = pick(table, def("Pawn_IsDBNO"), {"Pawn_IsDBNO", "bIsDBNO", "IsDBNO"});
+    g.Actor_RootComponent = pick(table, def("Actor_RootComponent"), {"Actor_RootComponent", "RootComponent"});
+    g.SceneComponent_RelativeLocation = pick(table, def("SceneComponent_RelativeLocation"), {"SceneComponent_RelativeLocation", "RelativeLocation"});
+    g.PlayerState_PlayerName = pick(table, def("PlayerState_PlayerName"), {"PlayerState_PlayerName", "PlayerName", "PlayerNamePrivate"});
+    g.PlayerState_PlayerNameAlt = pick(table, def("PlayerState_PlayerNameAlt"), {"PlayerState_PlayerNameAlt"});
+    g.PlayerState_TeamIndex = pick(table, def("PlayerState_TeamIndex"), {"PlayerState_TeamIndex", "TeamIndex"});
+    g.PlayerState_IsABot = pick(table, def("PlayerState_IsABot"), {"PlayerState_IsABot", "IsABot", "bIsABot"});
+    g.Mesh_BoneArray = pick(table, def("Mesh_BoneArray"), {"Mesh_BoneArray", "BoneArray"});
+    g.Mesh_ComponentToWorld = pick(table, def("Mesh_ComponentToWorld"), {"Mesh_ComponentToWorld", "ComponentToWorld"});
+
+    diag::offsetsCount = static_cast<int>(sizeof(kDefaults) / sizeof(kDefaults[0]));
+
+    const std::wstring dumpPath = exe_directory() + L"\\offsets.json";
+    std::string probe;
+    if (!read_file(dumpPath, probe)) {
+        dump_json(dumpPath);
+        std::wprintf(L"  [info] offsets.json genere : %s\n", dumpPath.c_str());
     }
 
-    std::wprintf(L"  [ok] offsets charges (control rotation : %s)\n",
-                 g.PlayerController_ControlRotation ? L"oui" : L"non");
+    std::wprintf(L"  [ok] %d offsets resolus (defauts 42.40 + surcharges)\n", diag::offsetsCount);
     return true;
 }
 
@@ -476,7 +580,6 @@ struct Player {
     uintptr_t mesh = 0;
     Vec3 location;
     std::wstring name;
-    float health = 100.0f;
     int team = 0;
     bool bot = false;
     bool dbno = false;
@@ -487,7 +590,6 @@ struct Player {
 struct Cache {
     uintptr_t pawn = 0;
     uintptr_t playerState = 0;
-    uintptr_t mesh = 0;
     std::wstring name;
 };
 
@@ -523,13 +625,79 @@ std::wstring read_fstring(uintptr_t address) {
     return name;
 }
 
+// Le global UWorld est chiffre sur 42.40 : on passe par gEngine -> GameViewport -> World.
+uintptr_t resolve_world() {
+    if (offsets::g.GameEngine && offsets::g.GameEngine_GameViewport &&
+        offsets::g.GameViewport_World) {
+        const uintptr_t engine = mem::read<uintptr_t>(mem::g_base + offsets::g.GameEngine);
+        if (engine) {
+            const uintptr_t viewport =
+                mem::read<uintptr_t>(engine + offsets::g.GameEngine_GameViewport);
+            if (viewport) {
+                const uintptr_t world =
+                    mem::read<uintptr_t>(viewport + offsets::g.GameViewport_World);
+                if (world) {
+                    return world;
+                }
+            }
+        }
+    }
+
+    if (offsets::g.GWorld) {
+        const uintptr_t world = mem::read<uintptr_t>(mem::g_base + offsets::g.GWorld);
+        if (world) {
+            return world;
+        }
+    }
+
+    return 0;
+}
+
+// ActorCluster -> Actors sur les builds recents, lecture directe en secours.
+uintptr_t resolve_actors(uintptr_t level, int32_t& count) {
+    count = 0;
+
+    if (offsets::g.Level_ActorCluster && offsets::g.LevelActorContainer_Actors) {
+        const uintptr_t cluster = mem::read<uintptr_t>(level + offsets::g.Level_ActorCluster);
+        if (cluster) {
+            const uintptr_t actors =
+                mem::read<uintptr_t>(cluster + offsets::g.LevelActorContainer_Actors);
+            const int32_t total =
+                mem::read<int32_t>(cluster + offsets::g.LevelActorContainer_Actors + 8);
+            if (actors && total > 0 && total < 40000) {
+                count = total;
+                return actors;
+            }
+        }
+    }
+
+    static const uintptr_t kDirect[] = {0x50, 0x98, 0xA0, 0xA8, 0xB0};
+    for (const uintptr_t offset : kDirect) {
+        const uintptr_t actors = mem::read<uintptr_t>(level + offset);
+        const int32_t total = mem::read<int32_t>(level + offset + 8);
+        if (!actors || total <= 0 || total > 40000) {
+            continue;
+        }
+
+        const uintptr_t first = mem::read<uintptr_t>(actors);
+        if (first && mem::read<uintptr_t>(first + offsets::g.Actor_RootComponent)) {
+            count = total;
+            return actors;
+        }
+    }
+
+    return 0;
+}
+
 void refresh_cache() {
     g_cache.clear();
 
-    const uintptr_t world = mem::read<uintptr_t>(mem::g_base + offsets::g.GWorld);
+    const uintptr_t world = resolve_world();
     if (!world) {
+        diag::worldOk = false;
         return;
     }
+    diag::worldOk = true;
 
     const uintptr_t levels = mem::read<uintptr_t>(world + offsets::g.World_Levels);
     if (!levels) {
@@ -548,9 +716,9 @@ void refresh_cache() {
             continue;
         }
 
-        const uintptr_t actors = mem::read<uintptr_t>(level + offsets::g.Level_Actors);
-        const int32_t actorCount = mem::read<int32_t>(level + offsets::g.Level_Actors + 8);
-        if (!actors || actorCount <= 0 || actorCount > 40000) {
+        int32_t actorCount = 0;
+        const uintptr_t actors = resolve_actors(level, actorCount);
+        if (!actors) {
             continue;
         }
 
@@ -575,9 +743,11 @@ void refresh_cache() {
             Cache cache;
             cache.pawn = actor;
             cache.playerState = playerState;
-            cache.mesh = mesh;
             if (offsets::g.PlayerState_PlayerName) {
                 cache.name = read_fstring(playerState + offsets::g.PlayerState_PlayerName);
+                if (cache.name.empty() && offsets::g.PlayerState_PlayerNameAlt) {
+                    cache.name = read_fstring(playerState + offsets::g.PlayerState_PlayerNameAlt);
+                }
             }
             g_cache.push_back(cache);
         }
@@ -599,8 +769,10 @@ void read_camera(uintptr_t controller) {
 
     g_cameraLocation = mem::read<Vec3>(pov);
     g_cameraRotation = mem::read<Rot>(pov + 0x18);
-    g_cameraFov = mem::read<double>(pov + 0x30);
-    if (g_cameraFov < 1.0 || g_cameraFov > 170.0) {
+
+    // FMinimalViewInfo::FOV est un float en UE5, pas un double.
+    g_cameraFov = mem::read<float>(pov + 0x30);
+    if (g_cameraFov < 1.0f || g_cameraFov > 170.0f) {
         g_cameraFov = 90.0;
     }
 
@@ -615,7 +787,7 @@ void update() {
         refresh_cache();
     }
 
-    const uintptr_t world = mem::read<uintptr_t>(mem::g_base + offsets::g.GWorld);
+    const uintptr_t world = resolve_world();
     if (!world) {
         return;
     }
@@ -649,7 +821,9 @@ void update() {
 
     if (g_localPawn) {
         const uintptr_t localState = mem::read<uintptr_t>(g_localPawn + offsets::g.Pawn_PlayerState);
-        g_localTeam = localState ? mem::read<int32_t>(localState + offsets::g.PlayerState_TeamIndex) : 0;
+        g_localTeam = localState
+                          ? static_cast<int>(mem::read<uint8_t>(localState + offsets::g.PlayerState_TeamIndex))
+                          : 0;
     }
 
     for (const Cache& cache : g_cache) {
@@ -668,20 +842,19 @@ void update() {
         player.mesh = mesh;
         player.name = cache.name;
         player.location = mem::read<Vec3>(root + offsets::g.SceneComponent_RelativeLocation);
-        player.health = mem::read<float>(cache.pawn + offsets::g.Pawn_Health);
-        player.team = mem::read<int32_t>(cache.playerState + offsets::g.PlayerState_TeamIndex);
-        player.bot = mem::read<uint8_t>(cache.playerState + offsets::g.PlayerState_IsABot) != 0;
-        player.dbno = mem::read<uint8_t>(cache.playerState + offsets::g.PlayerState_IsDBNO) != 0;
+        player.team = static_cast<int>(
+            mem::read<uint8_t>(cache.playerState + offsets::g.PlayerState_TeamIndex));
+        player.bot =
+            (mem::read<uint8_t>(cache.playerState + offsets::g.PlayerState_IsABot) & 0x08) != 0;
+        player.dbno = offsets::g.Pawn_IsDBNO
+                          ? (mem::read<uint8_t>(cache.pawn + offsets::g.Pawn_IsDBNO) & 0x01) != 0
+                          : false;
         player.local = cache.pawn == g_localPawn;
         player.distance = static_cast<float>(
             std::sqrt(std::pow(player.location.x - g_cameraLocation.x, 2) +
                       std::pow(player.location.y - g_cameraLocation.y, 2) +
                       std::pow(player.location.z - g_cameraLocation.z, 2)) /
             100.0);
-
-        if (player.health <= 0.0f || player.health > 200.0f) {
-            player.health = 100.0f;
-        }
 
         g_players.push_back(player);
     }
@@ -749,8 +922,9 @@ int g_width = 0;
 int g_height = 0;
 HFONT g_font = nullptr;
 
-bool g_visible = false;   // la fenetre overlay est-elle affichee ?
-bool g_anchored = false;  // la derniere sync() a-t-elle abouti ?
+bool g_visible = false;
+bool g_anchored = false;
+bool g_statusMode = false;   // pas de fenetre de jeu : petite boite de statut
 
 COLORREF to_gdi(uint32_t color) {
     return RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
@@ -812,10 +986,6 @@ bool create(HINSTANCE instance) {
     SelectObject(g_dc, g_font);
 
     SetBkMode(g_dc, TRANSPARENT);
-
-    // Volontairement pas de ShowWindow ici : une fenetre layered sans
-    // UpdateLayeredWindow s'affiche en rectangle noir. On la montre seulement
-    // quand on a une position, une taille et une premiere frame.
     return true;
 }
 
@@ -834,41 +1004,49 @@ void show() {
     }
 }
 
-// Recale l'overlay sur la zone client du jeu. Renvoie false si le jeu n'est pas
-// exploitable (fenetre absente, minimisee, taille nulle) : l'overlay est alors masque.
-bool sync() {
-    HWND game = mem::g_window;
-    if (!game || !IsWindow(game) || IsIconic(game)) {
-        hide();
-        return false;
-    }
-
-    RECT client{};
-    if (!GetClientRect(game, &client) || client.right < 320 || client.bottom < 240) {
-        hide();
-        return false;
-    }
-
-    POINT origin{0, 0};
-    ClientToScreen(game, &origin);
-
-    if (!resize(client.right, client.bottom)) {
-        hide();
-        return false;
-    }
-
+void place(int x, int y, int width, int height) {
     RECT current{};
     GetWindowRect(g_window, &current);
-    if (current.left != origin.x || current.top != origin.y ||
-        current.right - current.left != client.right || current.bottom - current.top != client.bottom) {
-        SetWindowPos(g_window, HWND_TOPMOST, origin.x, origin.y, client.right, client.bottom,
-                     SWP_NOACTIVATE);
+    if (current.left != x || current.top != y || current.right - current.left != width ||
+        current.bottom - current.top != height) {
+        SetWindowPos(g_window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+    }
+}
+
+bool sync() {
+    HWND game = mem::g_window;
+
+    if (game && IsWindow(game) && !IsIconic(game)) {
+        RECT client{};
+        if (GetClientRect(game, &client) && client.right >= 320 && client.bottom >= 240) {
+            POINT origin{0, 0};
+            ClientToScreen(game, &origin);
+
+            if (resize(client.right, client.bottom)) {
+                place(origin.x, origin.y, client.right, client.bottom);
+                sdk::g_screenWidth = client.right;
+                sdk::g_screenHeight = client.bottom;
+                g_statusMode = false;
+                g_anchored = true;
+                return true;
+            }
+        }
     }
 
-    sdk::g_screenWidth = client.right;
-    sdk::g_screenHeight = client.bottom;
-    g_anchored = true;
-    return true;
+    // Pas de jeu : petite boite de statut en haut a gauche, pour voir ou ca bloque.
+    constexpr int kBoxWidth = 560;
+    constexpr int kBoxHeight = 230;
+    if (resize(kBoxWidth, kBoxHeight)) {
+        place(24, 24, kBoxWidth, kBoxHeight);
+        sdk::g_screenWidth = kBoxWidth;
+        sdk::g_screenHeight = kBoxHeight;
+        g_statusMode = true;
+        g_anchored = true;
+        return true;
+    }
+
+    hide();
+    return false;
 }
 
 void clear() {
@@ -900,7 +1078,6 @@ void present() {
     UpdateLayeredWindow(g_window, screen, &destination, &size, g_dc, &source, 0, &blend, ULW_ALPHA);
     ReleaseDC(nullptr, screen);
 
-    // Premiere frame deja dessinee : on peut afficher sans flash noir.
     show();
 }
 
@@ -921,17 +1098,6 @@ void filled(int x, int y, int width, int height, uint32_t color) {
     HBRUSH brush = CreateSolidBrush(to_gdi(color));
     FillRect(g_dc, &area, brush);
     DeleteObject(brush);
-}
-
-void line(int x1, int y1, int x2, int y2, uint32_t color) {
-    HPEN pen = CreatePen(PS_SOLID, 1, to_gdi(color));
-    HGDIOBJ oldPen = SelectObject(g_dc, pen);
-
-    MoveToEx(g_dc, x1, y1, nullptr);
-    LineTo(g_dc, x2, y2);
-
-    SelectObject(g_dc, oldPen);
-    DeleteObject(pen);
 }
 
 void text(int x, int y, const std::wstring& value, uint32_t color, bool centered) {
@@ -1077,7 +1243,6 @@ void bullet_tp(bool active) {
 
     const sdk::Vec3 aim = sdk::aim_point(*target);
 
-    // 1) rotation memoire : le jeu pointe lui-meme sur la cible (offset optionnel).
     if (offsets::g.PlayerController_ControlRotation && sdk::g_controller) {
         constexpr double pi = 3.14159265358979323846;
         const double dx = aim.x - sdk::g_cameraLocation.x;
@@ -1093,7 +1258,6 @@ void bullet_tp(bool active) {
         mem::write(sdk::g_controller + offsets::g.PlayerController_ControlRotation, rotation);
     }
 
-    // 2) snap souris : convergence en 2-3 frames meme sans l'offset.
     sdk::Vec2 screen{};
     if (sdk::world_to_screen(aim, screen)) {
         input::move_mouse(screen.x - sdk::g_screenWidth / 2.0f,
@@ -1147,11 +1311,6 @@ void esp(bool enabled) {
                    player.bot ? L"  [bot]" : L"");
         overlay::text(left + boxWidth / 2, topY + boxHeight + 2, buffer, cfg::kColorText, true);
 
-        const float ratio = std::clamp(player.health / 100.0f, 0.0f, 1.0f);
-        overlay::filled(left - 6, topY - 1, 3, boxHeight + 1, 0x141414);
-        overlay::filled(left - 6, topY + static_cast<int>((boxHeight + 1) * (1.0f - ratio)), 3,
-                        static_cast<int>((boxHeight + 1) * ratio), 0x32E632);
-
         if (enabled) {
             sdk::Vec2 aimScreen{};
             if (sdk::world_to_screen(sdk::aim_point(player), aimScreen)) {
@@ -1179,6 +1338,37 @@ void legend(bool espOn, int fps, bool memoryTp) {
     overlay::text(10, 98, buffer, cfg::kColorDim, false);
 }
 
+void status(int fps) {
+    wchar_t buffer[192]{};
+    int y = 10;
+
+    overlay::text(12, y, L"Retrac OGFN - external  (pas de fenetre de jeu)", cfg::kColorText, false);
+    y += 24;
+
+    swprintf_s(buffer, L"process Fortnite : %s", diag::processOk ? L"attache" : L"en attente...");
+    overlay::text(12, y, buffer, diag::processOk ? cfg::kColorLocal : cfg::kColorBot, false);
+    y += 20;
+
+    swprintf_s(buffer, L"offsets : %d (defauts 42.40 + offsets.json)", diag::offsetsCount);
+    overlay::text(12, y, buffer, cfg::kColorDim, false);
+    y += 20;
+
+    swprintf_s(buffer, L"UWorld : %s", diag::worldOk ? L"OK" : L"en attente...");
+    overlay::text(12, y, buffer, diag::worldOk ? cfg::kColorLocal : cfg::kColorBot, false);
+    y += 20;
+
+    swprintf_s(buffer, L"fenetre de jeu : %s", mem::g_window ? L"trouvee" : L"absente");
+    overlay::text(12, y, buffer, mem::g_window ? cfg::kColorLocal : cfg::kColorBot, false);
+    y += 20;
+
+    swprintf_s(buffer, L"joueurs : %d   |   %d fps", static_cast<int>(sdk::g_players.size()), fps);
+    overlay::text(12, y, buffer, cfg::kColorDim, false);
+    y += 24;
+
+    overlay::text(12, y, L"Fortnite doit etre en fenetre sans bordure, pas en plein ecran exclusif.",
+                  cfg::kColorDim, false);
+}
+
 } // namespace features
 
 // ---------------------------------------------------------------------------
@@ -1187,12 +1377,25 @@ void legend(bool espOn, int fps, bool memoryTp) {
 
 namespace {
 
+FILE* g_logFile = nullptr;
+
 void log(const wchar_t* format, ...) {
     va_list args;
     va_start(args, format);
     std::vwprintf(format, args);
     va_end(args);
     fflush(stdout);
+
+    if (!g_logFile && !diag::logPath.empty()) {
+        _wfopen_s(&g_logFile, diag::logPath.c_str(), L"w, ccs=UTF-8");
+    }
+    if (g_logFile) {
+        va_list fileArgs;
+        va_start(fileArgs, format);
+        vfwprintf(g_logFile, format, fileArgs);
+        va_end(fileArgs);
+        fflush(g_logFile);
+    }
 }
 
 void attach_console() {
@@ -1203,6 +1406,7 @@ void attach_console() {
     FILE* dummy = nullptr;
     freopen_s(&dummy, "CONOUT$", "w", stdout);
     freopen_s(&dummy, "CONOUT$", "w", stderr);
+    freopen_s(&dummy, "CONIN$", "r", stdin);   // sinon getchar() renvoie EOF direct
 
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleTitleW(L"Retrac OGFN - external");
@@ -1214,10 +1418,27 @@ void banner() {
     log(L"  --------------------------------------------\n");
 }
 
+void wait_exit() {
+    log(L"\n  Entree pour quitter...");
+    getchar();
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     attach_console();
+
+    {
+        wchar_t exePath[MAX_PATH * 2]{};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH * 2);
+        std::wstring directory = exePath;
+        const size_t slash = directory.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            directory.resize(slash);
+        }
+        diag::logPath = directory + L"\\RetracExternal.log";
+    }
+
     banner();
 
     if (mem::enable_debug_privilege()) {
@@ -1227,10 +1448,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     if (!offsets::load()) {
-        log(L"\n  offsets.json attendu dans %%LOCALAPPDATA%%\\RetracOGFN\\\n");
-        log(L"  ou a cote de l'exe. Lance une fois l'outil interne pour le generer.\n");
-        log(L"\n  Entree pour quitter...");
-        getchar();
+        log(L"  [erreur] chargement offsets impossible\n");
+        wait_exit();
         return 1;
     }
 
@@ -1248,43 +1467,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
     if (!pid) {
         log(L"\n  [erreur] FortniteClient-Win64-Shipping.exe introuvable\n");
-        log(L"\n  Entree pour quitter...");
-        getchar();
+        wait_exit();
         return 1;
     }
 
     if (!mem::attach(pid)) {
-        log(L"\n  [erreur] attache au process %lu impossible (base module)\n", pid);
-        log(L"\n  Entree pour quitter...");
-        getchar();
+        log(L"\n  [erreur] attache au process %lu impossible\n", pid);
+        wait_exit();
         return 1;
     }
+    diag::processOk = true;
 
     log(L"\n  [ok] process %lu, base 0x%llX\n", pid,
         static_cast<unsigned long long>(mem::g_base));
 
-    log(L"  [info] recherche de la fenetre de jeu...\n");
-    for (int attempt = 0; attempt < 240 && !mem::g_window; ++attempt) {
-        mem::g_window = mem::find_window(pid);
-        if (!mem::g_window) {
-            if (attempt % 4 == 0) {
-                log(L".");
-            }
-            Sleep(500);
-        }
-    }
-
-    if (mem::g_window) {
-        log(L"\n  [ok] fenetre de jeu trouvee\n");
-    } else {
-        log(L"\n  [avert] fenetre de jeu introuvable : overlay masque pour l'instant\n");
-        log(L"          Fortnite doit etre en fenetre sans bordure (pas plein ecran exclusif).\n");
-    }
-
     if (!overlay::create(instance)) {
         log(L"  [erreur] creation overlay impossible\n");
-        log(L"\n  Entree pour quitter...");
-        getchar();
+        wait_exit();
         return 1;
     }
 
@@ -1296,7 +1495,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     int fps = 0;
     ULONGLONG fpsTime = GetTickCount64();
     ULONGLONG windowRetry = GetTickCount64();
-    bool warnedWindow = mem::g_window != nullptr;
+    bool announcedWindow = false;
 
     bool running = true;
     while (running) {
@@ -1305,13 +1504,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             break;
         }
 
-        // La fenetre peut apparaitre (ou revenir) apres coup : on retente.
         if (!mem::g_window && GetTickCount64() - windowRetry > 1000) {
             windowRetry = GetTickCount64();
             mem::g_window = mem::find_window(pid);
-            if (mem::g_window && !warnedWindow) {
+            if (mem::g_window && !announcedWindow) {
                 log(L"  [ok] fenetre de jeu trouvee\n");
-                warnedWindow = true;
+                announcedWindow = true;
             }
         }
 
@@ -1327,16 +1525,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         sdk::update();
 
-        features::esp(espOn);
-        features::aimbot(input::down(cfg::kAimbotKey));
-        features::bullet_tp(input::down(cfg::kBulletTpKey));
+        if (overlay::g_statusMode) {
+            features::status(fps);
+        } else {
+            features::esp(espOn);
+            features::aimbot(input::down(cfg::kAimbotKey));
+            features::bullet_tp(input::down(cfg::kBulletTpKey));
 
-        if (sdk::g_cameraValid) {
-            overlay::circle(sdk::g_screenWidth / 2, sdk::g_screenHeight / 2,
-                            static_cast<int>(cfg::kAimbotFov), 0x303030);
+            if (sdk::g_cameraValid) {
+                overlay::circle(sdk::g_screenWidth / 2, sdk::g_screenHeight / 2,
+                                static_cast<int>(cfg::kAimbotFov), 0x303030);
+            }
+
+            features::legend(espOn, fps, memoryTp);
         }
 
-        features::legend(espOn, fps, memoryTp);
         overlay::present();
 
         ++frames;
@@ -1356,7 +1559,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         DestroyWindow(overlay::g_window);
     }
 
-    log(L"\n  Entree pour quitter...");
-    getchar();
+    wait_exit();
     return 0;
 }
